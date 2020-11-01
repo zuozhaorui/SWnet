@@ -1,0 +1,242 @@
+import torch
+import torch.nn as nn
+import torch.utils.data as Data
+from torch.utils.data import Dataset, DataLoader
+from torch.optim import lr_scheduler
+import os
+import copy
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+import time
+from datetime import datetime
+import sys
+sys.path.append('..')
+import pickle
+import argparse
+import untils.until as untils
+
+torch.manual_seed(0)
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+device_ids = [0]
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(device)
+
+# graph dataset
+def load_tensor(file_name, dtype):
+    return [dtype(d).to(device) for d in np.load(file_name + '.npy')]
+
+def load_pickle(file_name):
+    with open(file_name, 'rb') as f:
+        return pickle.load(f)
+
+
+class CreateDataset(Dataset):
+    def __init__(self, rma_all, var_all, id):
+        self.rma_all = rma_all
+        self.var_all = var_all
+        self.all_id = id.values
+
+    def __len__(self):
+        return len(self.all_id)
+
+    def __getitem__(self, idx):
+        cell_line_id = self.all_id[idx][0]
+        drug_id = self.all_id[idx][1].astype('int')
+        y = self.all_id[idx][2].astype('float32')
+        rma = self.rma_all.loc[cell_line_id].values.astype('float32')
+        var = self.var_all.loc[cell_line_id].values.astype('float32')
+        return rma, var, drug_id, y
+
+
+class Model(nn.Module):
+    def __init__(self,dim,layer_gnn,drugs_num):
+        super(Model, self).__init__()
+        self.fuse_weight = torch.nn.Parameter(torch.FloatTensor(drugs_num, 1478), requires_grad=True).to(device)
+        self.fuse_weight.data.normal_(0.5, 0.25)
+
+        self.embed_fingerprint = nn.Embedding(n_fingerprint, dim)
+        self.W_gnn = nn.ModuleList([nn.Linear(dim, dim)
+                                    for _ in range(layer_gnn)])
+
+        self.gene = nn.Sequential(
+            nn.Conv1d(in_channels=1, out_channels=20, kernel_size=15, stride=2),
+            nn.BatchNorm1d(20),
+            nn.ReLU(),
+            nn.Conv1d(in_channels=20, out_channels=20, kernel_size=15, stride=2),
+            nn.BatchNorm1d(20),
+            nn.ReLU(),
+            nn.Conv1d(in_channels=20, out_channels=10, kernel_size=15, stride=2),
+            nn.BatchNorm1d(10),
+            nn.ReLU(),
+            nn.MaxPool1d(kernel_size=3, stride=3),
+            nn.Linear(57, 32),
+            nn.ReLU(),
+            nn.Dropout(p=0.1)
+        )
+
+        self.merged = nn.Sequential(
+            nn.Linear(370,300),
+            nn.Tanh(),
+            nn.Dropout(p=0.1),
+            nn.Conv1d(in_channels=1, out_channels=10, kernel_size=10, stride=2),
+            nn.BatchNorm1d(10),
+            nn.MaxPool1d(kernel_size=5, stride=5),
+            nn.Conv1d(in_channels=10, out_channels=5, kernel_size=10, stride=2),
+            nn.BatchNorm1d(5),
+            nn.MaxPool1d(kernel_size=5, stride=5),
+            nn.Dropout(p=0.1)
+        )
+        self.out = nn.Sequential(
+            # nn.Linear(40, 20),
+            # nn.Dropout(p=0.1),
+            nn.Linear(10,1)
+        )
+
+    def gnn(self, xs, A, layer):
+        for i in range(layer):
+            hs = torch.relu(self.W_gnn[i](xs))
+            xs = xs + torch.matmul(A, hs)
+        # return torch.unsqueeze(torch.sum(xs, 0), 0)
+        return torch.unsqueeze(torch.mean(xs, 0), 0)
+
+    def attention(self,fuse_weight,drug_ids,var):
+
+        drug_ids = drug_ids.numpy().tolist()
+        com = torch.zeros(len(drug_ids), 1478).to(device)
+
+        for i in range(len(drug_ids)):
+            com[i] = torch.mv(fuse_weight.permute(1, 0), similarity_softmax[GDSC_drug_dict[drug_ids[i]]]) * var[i]
+
+        return com.view(-1,1478)
+
+    def combine(self, rma, var,drug_id):
+        self.fuse_weight.data = torch.clamp(self.fuse_weight, 0, 1)
+        attention_var = self.attention(self.fuse_weight, drug_id, var)
+        z = rma + attention_var
+        return z
+
+    def forward(self, rma, var, drug_id):
+        com = self.combine(rma, var,drug_id)
+        com = com.unsqueeze(1)
+        out = self.gene(com)
+        out_gene = out.view(out.size(0), -1)
+
+        """Compound vector with GNN."""
+        batch_graph = [graph_dataset[GDSC_drug_dict[i]] for i in drug_id.numpy().tolist()]
+        compound_vector = torch.FloatTensor(drug_id.shape[0],dim).to(device)
+        for i,graph in enumerate(batch_graph):
+            fingerprints, adjacency = graph
+            fingerprints.to(device)
+            adjacency.to(device)
+            fingerprint_vectors = self.embed_fingerprint(fingerprints)
+            compound_vector[i] = self.gnn(fingerprint_vectors, adjacency, layer_gnn)
+
+        # print(out.size(0),out.size(1))
+
+        concat = torch.cat([out_gene, compound_vector], dim=1)
+        # concat = concat.view(concat.size(0), -1)
+        concat = concat.unsqueeze(1)
+
+        merge = self.merged(concat)
+        # print(merge.size(0), merge.size(1))
+        merge = merge.view(merge.size(0), -1)
+
+        y_pred = self.out(merge)
+        return y_pred
+
+def eval_model(model):
+    from sklearn.metrics import r2_score, mean_squared_error
+    y_pred = []
+    y_true = []
+    model.eval()
+    for step, (rma, var, drug_id,y) in tqdm(enumerate(test_loader)):
+        rma = rma.cuda(device=device_ids[0])
+        var = var.cuda(device=device_ids[0])
+        y = y.cuda(device=device_ids[0])
+        y = y.view(-1, 1)
+        # print('y',y)
+        y_true += y.cpu().detach().numpy().tolist()
+        y_pred_step = model(rma, var, drug_id)
+        y_pred += y_pred_step.cpu().detach().numpy().tolist()
+    return mean_squared_error(y_true, y_pred),r2_score(y_true, y_pred)
+
+
+if __name__ == '__main__':
+
+    """hyper-parameter"""
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--LR", type=float, default=0.001)
+    parser.add_argument("--BATCH_SIZE", type=int, default=1024)
+    parser.add_argument("--step_size", type=int, default=150)
+    parser.add_argument("--gamma", type=float, default=0.5)
+    parser.add_argument("--radius", type=int, default=3)
+    parser.add_argument("--split_case", type=int, default=0)
+    parser.add_argument("--dim", type=int, default=50)
+    parser.add_argument("--layer_gnn", type=int, default=3)
+    args = parser.parse_args()
+
+    LR = args.LR
+    BATCH_SIZE = args.BATCH_SIZE
+    step_size = args.step_size
+    gamma = args.gamma
+    split_case = args.split_case
+    radius = args.radius
+    dim = args.dim
+    layer_gnn = args.layer_gnn
+
+    """Load preprocessed drug graph data."""
+    dir_input = ('../data/graph_data/' + 'radius' + str(radius) + '/')
+    compounds = load_tensor(dir_input + 'compounds', torch.LongTensor)
+    adjacencies = load_tensor(dir_input + 'adjacencies', torch.FloatTensor)
+    fingerprint_dict = load_pickle(dir_input + 'fingerprint_dict.pickle')
+    n_fingerprint = len(fingerprint_dict)
+
+    """Create a dataset and split it into train/dev/test."""
+    graph_dataset = list(zip(compounds, adjacencies))
+
+    """Load GDSC data."""
+    rma, var, GDSC_smiles = untils.load_GDSC_data()
+
+    GDSC_smiles_vals = GDSC_smiles["smiles"].values
+    GDSC_smiles_index = GDSC_smiles.index
+    GDSC_cell_names = rma.index.values
+    GDSC_gene = rma.columns.values
+    drugs_num = len(GDSC_smiles_index)
+
+    GDSC_drug_dict = untils.get_drug_dict(GDSC_smiles_index)
+
+    """Load GDSC_drug similarity data."""
+
+    data = pd.read_csv("../data/drug_similarity/GDSC_drug_similarity.csv", header=None)
+    similarity_softmax = torch.from_numpy(data.to_numpy().astype(np.float32))
+    similarity_softmax = similarity_softmax.to(device)
+
+    """split dataset"""
+    train_id, test_id = untils.split_data(split_case=split_case, ratio=0.9,
+                                   GDSC_cell_names=GDSC_cell_names)
+
+
+    dataset_sizes = {'train': len(train_id), 'test': len(test_id)}
+    print(dataset_sizes['train'], dataset_sizes['test'])
+
+    trainDataset = CreateDataset(rma, var, train_id)
+    testDataset = CreateDataset(rma, var, test_id)
+
+    # Dataloader
+    train_loader = Data.DataLoader(dataset=trainDataset, batch_size=BATCH_SIZE * len(device_ids), shuffle=True)
+    test_loader = Data.DataLoader(dataset=testDataset, batch_size=BATCH_SIZE * len(device_ids), shuffle=True)
+
+    """create SWnet model"""
+    model_ft = Model(dim, layer_gnn, drugs_num)
+
+    """cuda"""
+    model_ft = model_ft.cuda(device=device_ids[0])  #
+
+    """start training model !"""
+    print("start evaluating model")
+
+    model_ft.load_state_dict(torch.load("../log/pth/0.9384_SWnet_self-attention_train_r3_s0.pth"))
+    mse, r2 = eval_model(model_ft)
+    print('mse:{},r2:{}'.format(mse, r2))
