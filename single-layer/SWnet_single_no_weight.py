@@ -17,7 +17,7 @@ import argparse
 import untils.until as untils
 
 torch.manual_seed(0)
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 device_ids = [0]
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(device)
@@ -260,7 +260,7 @@ if __name__ == '__main__':
     print("Log is start!")
 
     """Load preprocessed drug graph data."""
-    dir_input = ('../data/graph_data/' + 'radius' + str(radius) + '/')
+    dir_input = ('../data/GDSC/graph_data/' + 'radius' + str(radius) + '/')
     compounds = load_tensor(dir_input + 'compounds', torch.LongTensor)
     adjacencies = load_tensor(dir_input + 'adjacencies', torch.FloatTensor)
     fingerprint_dict = load_pickle(dir_input + 'fingerprint_dict.pickle')
@@ -269,7 +269,6 @@ if __name__ == '__main__':
     """Create a dataset and split it into train/dev/test."""
     graph_dataset = list(zip(compounds, adjacencies))
 
-    """Load GDSC data."""
     rma, var, GDSC_smiles = untils.load_GDSC_data()
 
     GDSC_smiles_vals = GDSC_smiles["smiles"].values
@@ -278,16 +277,17 @@ if __name__ == '__main__':
     GDSC_gene = rma.columns.values
     drugs_num = len(GDSC_smiles_index)
 
-    GDSC_drug_dict = untils.get_drug_dict(GDSC_smiles_index)
+    GDSC_drug_dict = untils.get_drug_dict(GDSC_smiles)
 
     """Load GDSC_drug similarity data."""
 
-    # data = pd.read_csv("../data/drug_similarity/GDSC_drug_similarity.csv", header=None)
-    # similarity_softmax = torch.from_numpy(data.to_numpy().astype(np.float32))
-    # similarity_softmax = similarity_softmax.to(device)
+    data = pd.read_csv("../data/GDSC/drug_similarity/GDSC_drug_similarity.csv", header=None)
+    similarity_softmax = torch.from_numpy(data.to_numpy().astype(np.float32))
+    similarity_softmax = similarity_softmax.to(device)
 
     """split dataset"""
-    train_id, test_id = untils.split_data(split_case=split_case, ratio=0.9,
+    data = pd.read_csv("../data/GDSC/GDSC_data/cell_drug_labels.csv", index_col=0)
+    train_id, test_id = untils.split_data(data,split_case=split_case, ratio=0.9,
                                    GDSC_cell_names=GDSC_cell_names)
 
 
