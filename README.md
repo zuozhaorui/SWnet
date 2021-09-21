@@ -2,10 +2,6 @@
 
 Core code for the paper "SWnet: a deep learning model for drug response prediction from cancer genomic signatures and compound chemical structures" by Zhaorui Zuo, Penglei Wang, Xiaowei Chen, Li Tian, Hui Ge & Dahong Qian.
 
-> ## Attention
----
-This repository need some time to update the dataset and source code, and the updation will be completed recently.
-
 > ## Resources
 ---
 
